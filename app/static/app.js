@@ -149,6 +149,9 @@ function updateBusy() {
   if (archiveBtn) archiveBtn.disabled = busy || !writable || archiveSubmitting || !state || state.status === "setup";
   const pauseBtn = $("#pause-btn");
   if (pauseBtn) pauseBtn.disabled = busy || !writable || !state || state.status !== "live";
+  // 撤回末条：演出中或已完成（含暂停时）且有已发记录才可用
+  const withdrawBtn = $("#withdraw-btn");
+  if (withdrawBtn) withdrawBtn.disabled = busy || !writable || !state || !state.issued.length;
   const resetBtn = $("#reset-btn");
   if (resetBtn) resetBtn.disabled = busy || !writable;
   const startBtn = $("#start-show");
@@ -940,6 +943,22 @@ $("#pause-btn").addEventListener("click", () => {
   if (!state || state.status !== "live") return;
   // 提交目标暂停状态与页面所见版本号；同版本的其他操作先生效时会拿到 409
   api("/api/pause", { version: state.version, paused: !state.paused });
+});
+
+/* 撤回末条：误点确认后把最后一条已发提示退回待发队首（需二次确认）。
+ * 提交页面所见版本号与该条 cue_id；仅演出中或已完成、且它仍是最后已发时
+ * 生效（暂停时也可撤回），其他已发记录、待发顺序与问题记录均不变。 */
+$("#withdraw-btn").addEventListener("click", async () => {
+  if (!state || !state.issued.length) return;
+  const last = state.issued[state.issued.length - 1];
+  const ok = confirm(
+    `撤回末条：将把最后一条已发提示退回待发队首\n\n「${last.number}」${last.content}\n\n` +
+    "该条以发出时的内容快照作为待发内容（编号不变），清除发出时间与序号；" +
+    "其他已发记录、待发顺序与现场问题记录均不变。确认撤回吗？"
+  );
+  if (!ok) return;
+  const data = await api("/api/withdraw", { version: state.version, cue_id: last.id });
+  if (data) toast(`已撤回「${last.number}」，退回待发队首`);
 });
 
 $("#control-btn").addEventListener("click", () => {
