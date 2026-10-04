@@ -8,7 +8,9 @@
  *
  * 覆盖：未启用时旧行为；启用/接管后凭据保存与请求头；无凭据页只读可接管；
  * 403 后凭据清除与标记纠正；启动时提交缓存凭据核验（有效凭据刷新仍可写，
- * 被接管后的旧页刷新即只读、显示接管入口、失效凭据被清除，并可主动接管）。
+ * 被接管后的旧页刷新即只读、显示接管入口、失效凭据被清除，并可主动接管）；
+ * 撤回末条的按钮启用条件、二次确认、请求体（末条 cue_id + 版本）、凭据头、
+ * 暂停时可用与 409/403 后的状态刷新。
  *
  * 运行：node tests/control-seat.test.js
  */
@@ -112,7 +114,7 @@ function loadApp(storageData) {
   };
   vm.createContext(sandbox);
   vm.runInContext(appCode, sandbox, { filename: "app.js" });
-  return { document, pending, storage };
+  return { document, pending, storage, sandbox };
 }
 
 const flush = () => new Promise((r) => setImmediate(r));
@@ -147,6 +149,18 @@ function liveState(over) {
     min_cues: 2,
     max_cues: 12,
   }, over || {});
+}
+
+/* 已有一条已发（A1）、当前指向 A2 的演出状态：撤回末条用例使用。 */
+function issuedState(over) {
+  return liveState(Object.assign({
+    current: { id: 2, number: "A2", content: "音乐起" },
+    next: null,
+    pending: [{ id: 2, number: "A2", content: "音乐起" }],
+    issued: [{ id: 1, number: "A1", content: "灯光渐亮", issued_at: "2026-10-04T10:00:00+00:00" }],
+    total: 2,
+    remaining: 1,
+  }, over || {}));
 }
 
 /* ------------------------------------------------------------ 断言 */
@@ -345,6 +359,109 @@ async function t7_takenOver_oldTabReloads_readonlyAndCanTakeover() {
   check(reloadedA.storage.getItem("cueControlToken") === "tok-A2", "新凭据已保存");
 }
 
+/* ------------------------------------------------------------ 撤回末条 */
+
+async function w1_withdrawButton_gatingAndRequest() {
+  console.log("W1 撤回末条：无已发禁用；有已发时二次确认后提交末条 id 与版本");
+  const ctx = loadApp();
+  await respond(lastRequest(ctx), liveState()); // 演出中但尚无已发
+  check(ctx.document.el("withdraw-btn").disabled === true, "无已发记录时撤回按钮禁用");
+
+  // 已有一条已发
+  const s1 = issuedState();
+  const startup2Ctx = loadApp();
+  await respond(lastRequest(startup2Ctx), s1);
+  check(startup2Ctx.document.el("withdraw-btn").disabled === false, "有已发记录时撤回按钮可用");
+
+  // 拒绝二次确认：不发请求
+  const pendingBefore = startup2Ctx.pending.length;
+  startup2Ctx.sandbox.confirm = () => false;
+  startup2Ctx.document.el("withdraw-btn").dispatch("click");
+  check(startup2Ctx.pending.length === pendingBefore, "二次确认被取消时不发请求");
+
+  // 允许二次确认
+  startup2Ctx.sandbox.confirm = () => true;
+  startup2Ctx.document.el("withdraw-btn").dispatch("click");
+  const req = lastRequest(startup2Ctx);
+  check(req.path === "/api/withdraw", "确认后请求撤回接口");
+  const body = JSON.parse(req.options.body);
+  check(body.cue_id === 1, "提交页面所见的末条已发 cue_id");
+  check(body.version === 3, "提交页面所见版本号");
+  check(!("X-Control-Token" in req.options.headers), "未启用控制席时不带凭据头");
+
+  // 成功：A1 按发出快照回到待发队首
+  const after = liveState({
+    version: 4,
+    current: { id: 1, number: "A1", content: "灯光渐亮" },
+    next: { id: 2, number: "A2", content: "音乐起" },
+    pending: [
+      { id: 1, number: "A1", content: "灯光渐亮" },
+      { id: 2, number: "A2", content: "音乐起" },
+    ],
+    issued: [],
+    remaining: 2,
+  });
+  await respond(req, after);
+  check(startup2Ctx.document.el("withdraw-btn").disabled === true, "撤回后已发清空，按钮重新禁用");
+  check(startup2Ctx.document.el("version-badge").textContent === "v4", "页面应用成功响应的新版本");
+}
+
+async function w2_withdraw_pausedAllowedAndTokenHeader() {
+  console.log("W2 暂停时也可撤回；启用控制席后请求携带凭据，403 后按钮禁用");
+  // 暂停 + 有已发
+  const ctx = loadApp({ cueControlToken: "tok-x" });
+  await respond(lastRequest(ctx), issuedState({
+    version: 6,
+    paused: true,
+    control_enabled: true,
+    control_granted: true,
+  }));
+  check(ctx.document.el("withdraw-btn").disabled === false, "暂停期间撤回按钮仍可用（确认按钮禁用）");
+  check(ctx.document.el("confirm-btn").disabled === true, "暂停期间确认按钮禁用、撤回不受影响");
+
+  ctx.document.el("withdraw-btn").dispatch("click"); // confirm stub 默认 true
+  const req = lastRequest(ctx);
+  check(req.path === "/api/withdraw", "暂停时发出撤回请求");
+  check(req.options.headers["X-Control-Token"] === "tok-x", "撤回请求携带控制席凭据");
+  check(JSON.parse(req.options.body).version === 6, "携带当前版本号");
+  await respond(req, issuedState({
+    version: 7,
+    paused: true,
+    control_enabled: true,
+    control_granted: true,
+    status: "live",
+    current: { id: 1, number: "A1", content: "灯光渐亮" },
+    next: { id: 2, number: "A2", content: "音乐起" },
+    pending: [
+      { id: 1, number: "A1", content: "灯光渐亮" },
+      { id: 2, number: "A2", content: "音乐起" },
+    ],
+    issued: [],
+    remaining: 2,
+  }));
+  check(ctx.document.el("version-badge").textContent === "v7", "暂停态撤回成功后版本更新");
+}
+
+async function w3_withdraw_conflictAndForbidden_refresh() {
+  console.log("W3 撤回遇 409/403：页面刷新为最新状态，写入口按资格更新");
+  // 409：他人先操作（例如末条已被另一页撤回）
+  const ctx = loadApp();
+  await respond(lastRequest(ctx), issuedState());
+  ctx.document.el("withdraw-btn").dispatch("click");
+  await respond(lastRequest(ctx), {
+    error: "conflict",
+    message: "操作已过期",
+    state: liveState({ version: 8, issued: [] }), // 末条已被撤回：已发清空
+  }, 409);
+  check(ctx.document.el("version-badge").textContent === "v8", "409 后页面刷新为最新版本");
+  check(ctx.document.el("withdraw-btn").disabled === true, "最新状态无已发，撤回按钮禁用");
+
+  // 403：只读页点击撤回（按钮本应禁用；即便发出也由服务端拒绝并纠正标记）
+  const ro = loadApp();
+  await respond(lastRequest(ro), issuedState({ control_enabled: true, control_granted: false }));
+  check(ro.document.el("withdraw-btn").disabled === true, "非控制席页面撤回按钮禁用");
+}
+
 /* ------------------------------------------------------------ 主流程 */
 
 (async function main() {
@@ -356,6 +473,9 @@ async function t7_takenOver_oldTabReloads_readonlyAndCanTakeover() {
     t5_enableConflict_noTokenStored,
     t6_tokenPersistsAcrossReload,
     t7_takenOver_oldTabReloads_readonlyAndCanTakeover,
+    w1_withdrawButton_gatingAndRequest,
+    w2_withdraw_pausedAllowedAndTokenHeader,
+    w3_withdraw_conflictAndForbidden_refresh,
   ];
   for (const run of cases) await run();
 

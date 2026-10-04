@@ -102,6 +102,7 @@ def main_flow():
         writes = [
             ("POST", "/api/setup", {"cues": CUES2}),
             ("POST", "/api/confirm", {"version": v}),
+            ("POST", "/api/withdraw", {"version": v, "cue_id": before["issued"][-1]["id"]}),
             ("POST", "/api/pause", {"version": v, "paused": True}),
             ("POST", "/api/edit", {"version": v, "cue_id": cue_id, "content": "改写"}),
             ("POST", "/api/reorder", {"version": v, "order": order}),

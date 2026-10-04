@@ -1,18 +1,19 @@
 """舞台提示执行台 —— FastAPI + SQLite 后端。
 
-并发模型：所有写操作（确认 / 暂停 / 恢复 / 编辑 / 重排 / 归档 / 设置 /
-问题记录 / 重置 / 以档案开新场）都在同一把锁内串行完成；其中带版本号的
-操作（确认 / 暂停恢复 / 编辑 / 重排 / 归档 / 问题记录 / 以档案开新场）在
-锁内完成"检查版本号 -> 修改数据"两个步骤，因此同一版本号上并发的两个操作
-只会有一个生效，另一个收到 409 及最新状态。归档的"写档案（含问题记录快照）
-+ 清空提示与问题记录"、以档案开新场的"写入新场提示 + 推进状态"、暂停恢复
-的"暂停标记 + 版本 +1"、问题记录的"插入记录 + 版本 +1"都在同一事务内
-提交，任一步失败整体回滚。
+并发模型：所有写操作（确认 / 撤回末条 / 暂停 / 恢复 / 编辑 / 重排 / 归档 /
+设置 / 问题记录 / 重置 / 以档案开新场）都在同一把锁内串行完成；其中带版本号
+的操作（确认 / 撤回末条 / 暂停恢复 / 编辑 / 重排 / 归档 / 问题记录 /
+以档案开新场）在锁内完成"检查版本号 -> 修改数据"两个步骤，因此同一版本号上
+并发的两个操作只会有一个生效，另一个收到 409 及最新状态。归档的"写档案
+（含问题记录快照）+ 清空提示与问题记录"、以档案开新场的"写入新场提示 +
+推进状态"、暂停恢复的"暂停标记 + 版本 +1"、问题记录的"插入记录 + 版本 +1"、
+撤回末条的"末条已发退回待发队首 + 完成态回到演出中 + 版本 +1"都在同一事务
+内提交，任一步失败整体回滚。
 
 单控制席：默认未启用，所有写操作保持旧行为。任意页面可凭当前版本号启用
 或接管控制席，"启用/接管 + 新凭据 + 版本号 +1"在同一事务内落库；启用后
-全部写操作（手工开场 / 确认 / 编辑 / 重排 / 暂停恢复 / 归档 / 重置 /
-以档案开新场 / 问题记录）须携带当前凭据（请求头 X-Control-Token）。身份
+全部写操作（手工开场 / 确认 / 撤回末条 / 编辑 / 重排 / 暂停恢复 / 归档 /
+重置 / 以档案开新场 / 问题记录）须携带当前凭据（请求头 X-Control-Token）。身份
 检查与业务写入在同一把锁、同一事务内生效——缺失或已被接管替换的旧凭据
 返回 403 且数据不变，不会出现"旧请求先通过检查、接管后再落库"的交错。
 凭据只随成功的启用/接管响应返回，状态查询不含凭据；查询接口始终可用。
@@ -467,6 +468,11 @@ class IssueIn(BaseModel):
     text: str
 
 
+class WithdrawIn(BaseModel):
+    version: int
+    cue_id: int  # 页面所见的最后一条已发提示 id
+
+
 class StartFromArchiveIn(BaseModel):
     version: int
 
@@ -664,6 +670,62 @@ def confirm(body: VersionedIn, x_control_token: Optional[str] = Header(default=N
         conn.execute(
             "UPDATE meta SET version = ?, status = ? WHERE id = 1",
             (new_version, "done" if remaining == 0 else "live"),
+        )
+        return build_state(conn, x_control_token)
+
+
+@app.post("/api/withdraw")
+def withdraw(body: WithdrawIn, x_control_token: Optional[str] = Header(default=None)):
+    """撤回末条已发提示：把本场最后一条已发提示退回当前待发队首。
+
+    供误点确认后补救：仅把该条提示退回待发，不撤销其他任何操作。提交页面
+    所见的 cue_id 与版本号；仅演出中（live，含暂停时）或已完成（done）且
+    该 cue_id 仍为最后一条已发提示时生效。退回时以其**发出快照**作为待发
+    内容（保留 id 与编号），清除发出快照、发出时间与发出序号，插到**现有
+    待发队首**（现有待发内容与相对顺序整体后移）；其他已发记录、待发内容
+    与相对顺序、问题记录快照均不变。已完成态撤回后回到演出中；暂停标记
+    保持不变；该提示再次确认时记新的服务端时间。
+
+    "退回待发（位置 / 内容 / 清空发出字段）+ 状态推进 + 版本 +1"在同一事务
+    内提交，写入失败则全部不变。与确认、编辑、重排、归档、暂停恢复、问题
+    记录等同版本竞争最多一个成功；版本过期、目标不是最后已发提示（含已被
+    撤回）或本场没有已发提示都返回 409 及最新状态。
+    """
+    with lock, db() as conn:
+        forbidden = control_check(conn, x_control_token)
+        if forbidden:
+            return forbidden
+        meta = conn.execute(
+            "SELECT version, status FROM meta WHERE id = 1"
+        ).fetchone()
+        if meta["status"] not in ("live", "done") or body.version != meta["version"]:
+            return conflict(conn, x_control_token)
+        last = conn.execute(
+            "SELECT * FROM cues WHERE status = 'issued' "
+            "ORDER BY issued_seq DESC, id DESC LIMIT 1"
+        ).fetchone()
+        if last is None or last["id"] != body.cue_id:
+            # 无已发提示，或页面指定的提示已不是最后一条（如已被先撤回）
+            return conflict(conn, x_control_token)
+
+        # 现有待发整体后挪，撤回提示以发出快照插到队首（内容取发出快照，
+        # id 与编号保留；发出快照 / 时间 / 序号清空）。
+        base = conn.execute(
+            "SELECT COALESCE(MAX(position), 0) AS m FROM cues"
+        ).fetchone()["m"]
+        conn.execute(
+            "UPDATE cues SET position = position + ? WHERE status = 'pending'",
+            (base + 1,),
+        )
+        conn.execute(
+            "UPDATE cues SET status = 'pending', content = issued_content, "
+            "position = 1, issued_content = NULL, issued_at = NULL, "
+            "issued_seq = NULL WHERE id = ?",
+            (last["id"],),
+        )
+        # 完成态退回一条即回到演出中；暂停标记不动。
+        conn.execute(
+            "UPDATE meta SET version = version + 1, status = 'live' WHERE id = 1"
         )
         return build_state(conn, x_control_token)
 

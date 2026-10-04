@@ -248,6 +248,10 @@ button.warning-outline { border-color: var(--accent); color: var(--accent); back
 .ops { flex: none; display: flex; gap: 6px; }
 .ops button { padding: 5px 10px; font-size: 13px; }
 
+/* 已发记录标题：右侧放置「撤回末条」，随标题右对齐 */
+.issued-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+button.small { padding: 3px 10px; font-size: 12px; }
+
 .pending-item.editing { flex-wrap: wrap; }
 .pending-item.editing .num-input { flex: 0 0 120px; }
 .pending-item.editing .content-input { flex: 1 1 100%; order: 3; }
